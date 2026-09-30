@@ -73,6 +73,28 @@ public static class ConfigurationScreen
             ),
 
             new HorizontalOption(
+                "Hold On Air Checkpoint",
+                "Knight stays on the point until control comes back",
+                new[] { "On", "Off" },
+                i =>
+                {
+                    settings.HoldAtAirCheckpoint = i == 0;
+                },
+                () => settings.HoldAtAirCheckpoint ? 0 : 1
+            ),
+
+            new HorizontalOption(
+                "Cross-Scene Respawn",
+                "No points in this room: respawn at the previous point instead",
+                new[] { "On", "Off" },
+                i =>
+                {
+                    settings.CrossSceneRespawnFallback = i == 0;
+                },
+                () => settings.CrossSceneRespawnFallback ? 0 : 1
+            ),
+
+            new HorizontalOption(
                 "Checkpoint Texture",
                 "Which picture is drawn as the checkpoint icon",
                 RespawnPointManager.CheckpointTextureNames,
