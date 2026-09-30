@@ -51,6 +51,11 @@ namespace RespawnPointManager
         public bool ManualCheckpointMode = false;
 
         public bool IgnoreEntryCheckpoint = true;
+
+        public bool HoldAtAirCheckpoint = true;
+
+        public bool CrossSceneRespawnFallback = true;
+
         public int CheckpointTextureIndex = 0;
 
         public int SpawnpointRenderMode = 0;
@@ -75,7 +80,7 @@ namespace RespawnPointManager
     public class RespawnPointManager : Mod, IGlobalSettings<GlobalSettings>, ICustomMenuMod
     {
         public static RespawnPointManager Instance;
-        public override string GetVersion() => "1.3.0";
+        public override string GetVersion() => "1.4.0";
 
         public static GlobalSettings Settings { get; set; } = new GlobalSettings();
         public void OnLoadGlobal(GlobalSettings s) => Settings = s;
@@ -83,6 +88,10 @@ namespace RespawnPointManager
 
         private const float TeleportLiftHeight = 0.2f;
         private const float DuplicatePointRadius = 2f;
+
+        private const float AirRespawnHoldTimeout = 5f;
+        private const float RespawnHoldMinTime = 0.75f;
+        private const float DefaultHeroGravityScale = 0.79f;
 
         private const float CheckpointIconWorldHeight = 0.84f;
 
@@ -146,6 +155,16 @@ namespace RespawnPointManager
         private bool _forceAcceptNextHazard = false;
 
         private float _blockEntryTimer = 0f;
+
+        private Coroutine _respawnHoldRoutine;
+        private bool _prevHazardDeath;
+        private bool _respawnRedirectActive;
+        private SpawnPoint? _fallbackPoint;
+
+        private static bool _controlFieldsResolved;
+        private static FieldInfo _acceptingInputField;
+        private static FieldInfo _controlRelinquishedField;
+
         public override void Initialize()
         {
             Instance = this;
@@ -153,10 +172,12 @@ namespace RespawnPointManager
 
             On.HeroController.Awake += Awake;
             On.HeroController.Update += OnHeroUpdate;
+            On.HeroController.HazardRespawn += OnHazardRespawn;
 
             UnityEngine.SceneManagement.SceneManager.activeSceneChanged += (oldScene, newScene) => {
                 if (!Settings.MultiSceneMode)
                 {
+                    CaptureFallbackPoint();
                     savedSpawns.Clear();
                     currentIndex = -1;
                 }
@@ -254,6 +275,10 @@ namespace RespawnPointManager
         {
             orig(self);
             if (PlayerData.instance == null) return;
+
+            bool hazardDeathNow = self.cState != null && self.cState.hazardDeath;
+            if (_prevHazardDeath && !hazardDeathNow) BeginRespawnHandling("hazardDeath ended");
+            _prevHazardDeath = hazardDeathNow;
 
             if (_blockEntryTimer > 0)
             {
@@ -370,6 +395,179 @@ namespace RespawnPointManager
                 }
             }
         }
+
+        private IEnumerator OnHazardRespawn(On.HeroController.orig_HazardRespawn orig, HeroController self)
+        {
+            BeginRespawnHandling("HazardRespawn hook");
+            return orig(self);
+        }
+
+        private void CaptureFallbackPoint()
+        {
+            if (savedSpawns.Count == 0) return;
+
+            int idx = (currentIndex >= 0 && currentIndex < savedSpawns.Count)
+                ? currentIndex
+                : savedSpawns.Count - 1;
+
+            _fallbackPoint = savedSpawns[idx];
+        }
+
+        private bool TryGetCrossSceneRespawn(out SpawnPoint target)
+        {
+            target = default;
+
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+            if (savedSpawns.Count > 0)
+            {
+                if (savedSpawns.Any(p => p.SceneName == scene)) return false;
+
+                int idx = (currentIndex >= 0 && currentIndex < savedSpawns.Count)
+                    ? currentIndex
+                    : savedSpawns.Count - 1;
+
+                target = savedSpawns[idx];
+                return true;
+            }
+
+            if (_fallbackPoint.HasValue && _fallbackPoint.Value.SceneName != scene)
+            {
+                target = _fallbackPoint.Value;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void BeginRespawnHandling(string source)
+        {
+            if (RespawnHoldDriver.IsHolding || _respawnRedirectActive) return;
+            if (HeroController.instance == null) return;
+
+            SpawnPoint target = default;
+            bool hasRedirect = false;
+
+            if (Settings.CrossSceneRespawnFallback)
+            {
+                hasRedirect = TryGetCrossSceneRespawn(out target);
+            }
+
+            if (hasRedirect)
+            {
+                Log($"[HazardSpawnMod] Respawn handling ({source}): redirecting to '{target.SceneName}' {target.Position}.");
+
+                _respawnRedirectActive = true;
+                StartRespawnRedirect(target);
+                return;
+            }
+
+            if (!Settings.HoldAtAirCheckpoint) return;
+
+            Vector3 anchor = PlayerData.instance != null ? PlayerData.instance.hazardRespawnLocation : Vector3.zero;
+            if (anchor == Vector3.zero) return;
+
+            Log($"[HazardSpawnMod] Respawn handling ({source}): holding at {anchor}.");
+
+            RespawnHoldDriver.Begin(anchor, RespawnHoldMinTime, AirRespawnHoldTimeout, null);
+        }
+
+        private void StartRespawnRedirect(SpawnPoint target)
+        {
+            if (GameManager.instance == null)
+            {
+                _respawnRedirectActive = false;
+                return;
+            }
+
+            if (_respawnHoldRoutine != null)
+                GameManager.instance.StopCoroutine(_respawnHoldRoutine);
+
+            _respawnHoldRoutine = GameManager.instance.StartCoroutine(RespawnRedirectRoutine(target));
+        }
+
+        private IEnumerator RespawnRedirectRoutine(SpawnPoint target)
+        {
+            isTeleporting = true;
+
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+            if (target.SceneName == scene)
+            {
+                var hero = HeroController.instance;
+                if (hero != null)
+                {
+                    var body = hero.GetComponent<Rigidbody2D>();
+                    if (body != null) body.velocity = Vector2.zero;
+
+                    hero.transform.position = new Vector3(target.Position.x, target.Position.y + TeleportLiftHeight, target.Position.z);
+                    ForceSaveHazardAtTeleport(target);
+                }
+            }
+            else
+            {
+                yield return CrossSceneTeleportRoutine(target);
+            }
+
+            string now = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+            int existing = savedSpawns.FindIndex(p => p.SceneName == now &&
+                                                     Vector3.Distance(p.Position, target.Position) < DuplicatePointRadius);
+
+            if (existing < 0)
+            {
+                savedSpawns.Add(target);
+                existing = savedSpawns.Count - 1;
+            }
+
+            currentIndex = existing;
+            _fallbackPoint = target;
+
+            UpdateHUD();
+            RefreshSceneMarkers();
+
+            isTeleporting = false;
+            _respawnRedirectActive = false;
+            _respawnHoldRoutine = null;
+
+            if (Settings.HoldAtAirCheckpoint)
+            {
+                RespawnHoldDriver.Begin(target.Position, RespawnHoldMinTime, AirRespawnHoldTimeout, null);
+            }
+
+            Log($"[HazardSpawnMod] Respawn redirect finished in '{now}' at {target.Position}, index {currentIndex}.");
+        }
+
+        private static void ResolveControlFields()
+        {
+            if (_controlFieldsResolved) return;
+            _controlFieldsResolved = true;
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            _acceptingInputField = typeof(HeroController).GetField("acceptingInput", flags);
+            _controlRelinquishedField = typeof(HeroController).GetField("controlReqlinquished", flags)
+                                        ?? typeof(HeroController).GetField("controlRelinquished", flags);
+
+            Instance?.Log($"[HazardSpawnMod] Control fields: acceptingInput={_acceptingInputField != null}, " +
+                          $"controlRelinquished={_controlRelinquishedField != null}.");
+        }
+
+        public static bool HeroHasControl(HeroController hc)
+        {
+            if (hc == null) return true;
+
+            if (hc.hero_state == GlobalEnums.ActorStates.no_input) return false;
+            if (hc.cState != null && (hc.cState.hazardRespawning || hc.cState.hazardDeath)) return false;
+
+            ResolveControlFields();
+
+            if (_controlRelinquishedField != null && (bool)_controlRelinquishedField.GetValue(hc)) return false;
+            if (_acceptingInputField != null && !(bool)_acceptingInputField.GetValue(hc)) return false;
+
+            return true;
+        }
+
         private void AddSpawnPoint(SpawnPoint point)
         {
             bool wasAtEnd = currentIndex == savedSpawns.Count - 1;
@@ -851,4 +1049,100 @@ namespace RespawnPointManager
             _hudHazard.SetActive(Settings.ShowCounter);
         }
     }
+
+    public class RespawnHoldDriver : MonoBehaviour
+    {
+        private static RespawnHoldDriver _instance;
+
+        public static bool IsHolding => _instance != null && _instance._active;
+
+        private bool _active;
+        private Vector3 _anchor;
+        private float _elapsed;
+        private float _minTime;
+        private float _maxTime;
+        private float _savedGravity;
+        private string _scene;
+        private Rigidbody2D _rb;
+        private System.Action _onFinished;
+
+        public static void Begin(Vector3 anchor, float minTime, float maxTime, System.Action onFinished)
+        {
+            if (_instance == null)
+            {
+                var go = new GameObject("RPM_RespawnHold");
+                DontDestroyOnLoad(go);
+                _instance = go.AddComponent<RespawnHoldDriver>();
+            }
+
+            _instance.StartHold(anchor, minTime, maxTime, onFinished);
+        }
+
+        private void StartHold(Vector3 anchor, float minTime, float maxTime, System.Action onFinished)
+        {
+            var hc = HeroController.instance;
+            if (hc == null)
+            {
+                onFinished?.Invoke();
+                return;
+            }
+
+            _anchor = anchor;
+            _minTime = minTime;
+            _maxTime = maxTime;
+            _onFinished = onFinished;
+            _elapsed = 0f;
+            _scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+            _rb = hc.GetComponent<Rigidbody2D>();
+            _savedGravity = (_rb != null && _rb.gravityScale > 0.01f) ? _rb.gravityScale : 0.79f;
+
+            _active = true;
+        }
+
+        private void LateUpdate()
+        {
+            if (!_active) return;
+
+            var hc = HeroController.instance;
+
+            if (hc == null ||
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != _scene ||
+                _elapsed >= _maxTime ||
+                (_elapsed >= _minTime && RespawnPointManager.HeroHasControl(hc)))
+            {
+                Finish(hc);
+                return;
+            }
+
+            if (_rb == null) _rb = hc.GetComponent<Rigidbody2D>();
+            if (_rb != null)
+            {
+                _rb.gravityScale = 0f;
+                _rb.velocity = Vector2.zero;
+            }
+
+            hc.transform.position = new Vector3(_anchor.x, _anchor.y, hc.transform.position.z);
+
+            _elapsed += Time.deltaTime;
+        }
+
+        private void Finish(HeroController hc)
+        {
+            _active = false;
+
+            if (_rb != null)
+            {
+                _rb.velocity = Vector2.zero;
+                _rb.gravityScale = _savedGravity;
+            }
+
+            _rb = null;
+
+            var cb = _onFinished;
+            _onFinished = null;
+            cb?.Invoke();
+        }
+    }
+
 }
