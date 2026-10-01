@@ -69,11 +69,15 @@ namespace RespawnPointManager
     {
         public Vector3 Position;
         public string SceneName;
+        public bool Manual;
 
-        public SpawnPoint(Vector3 position, string sceneName)
+        public SpawnPoint(Vector3 position, string sceneName) : this(position, sceneName, false) { }
+
+        public SpawnPoint(Vector3 position, string sceneName, bool manual)
         {
             Position = position;
             SceneName = sceneName;
+            Manual = manual;
         }
     }
 
@@ -85,12 +89,13 @@ namespace RespawnPointManager
         public static GlobalSettings Settings { get; set; } = new GlobalSettings();
         public void OnLoadGlobal(GlobalSettings s) => Settings = s;
         public GlobalSettings OnSaveGlobal() => Settings;
-
+        
         private const float TeleportLiftHeight = 0.2f;
         private const float DuplicatePointRadius = 2f;
 
         private const float AirRespawnHoldTimeout = 5f;
         private const float RespawnHoldMinTime = 0.75f;
+        private const float GroundProbeDistance = 1.5f;
         private const float DefaultHeroGravityScale = 0.79f;
 
         private const float CheckpointIconWorldHeight = 0.84f;
@@ -303,7 +308,7 @@ namespace RespawnPointManager
 
                     if (!savedSpawns.Any(p => p.SceneName == scene && Vector3.Distance(p.Position, currentHazard) < DuplicatePointRadius))
                     {
-                        AddSpawnPoint(new SpawnPoint(currentHazard, scene));
+                        AddSpawnPoint(new SpawnPoint(currentHazard, scene, true));
                     }
                 }
                 else if (isEntryCheckpoint && suppressEntryCheckpoint)
@@ -440,6 +445,30 @@ namespace RespawnPointManager
             return false;
         }
 
+        public static bool IsPointInAir(Vector3 pos)
+        {
+            int mask = LayerMask.GetMask("Terrain");
+            if (mask == 0) mask = 1 << 8;
+
+            var origin = new Vector2(pos.x, pos.y + 0.1f);
+            RaycastHit2D hit = Physics2D.Raycast(origin, Vector2.down, GroundProbeDistance + 0.1f, mask);
+
+            return hit.collider == null;
+        }
+
+        private bool ShouldHoldAt(Vector3 pos)
+        {
+            string scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+
+            int idx = savedSpawns.FindIndex(p => p.SceneName == scene &&
+                                                Vector3.Distance(p.Position, pos) < DuplicatePointRadius);
+
+            if (idx < 0) return false;
+            if (!savedSpawns[idx].Manual) return false;
+
+            return IsPointInAir(savedSpawns[idx].Position);
+        }
+
         private void BeginRespawnHandling(string source)
         {
             if (RespawnHoldDriver.IsHolding || _respawnRedirectActive) return;
@@ -467,7 +496,13 @@ namespace RespawnPointManager
             Vector3 anchor = PlayerData.instance != null ? PlayerData.instance.hazardRespawnLocation : Vector3.zero;
             if (anchor == Vector3.zero) return;
 
-            Log($"[HazardSpawnMod] Respawn handling ({source}): holding at {anchor}.");
+            if (!ShouldHoldAt(anchor))
+            {
+                Log($"[HazardSpawnMod] Respawn handling ({source}): {anchor} is not a manual air point, leaving it to the game.");
+                return;
+            }
+
+            Log($"[HazardSpawnMod] Respawn handling ({source}): holding at manual air point {anchor}.");
 
             RespawnHoldDriver.Begin(anchor, RespawnHoldMinTime, AirRespawnHoldTimeout, null);
         }
@@ -530,7 +565,7 @@ namespace RespawnPointManager
             _respawnRedirectActive = false;
             _respawnHoldRoutine = null;
 
-            if (Settings.HoldAtAirCheckpoint)
+            if (Settings.HoldAtAirCheckpoint && target.Manual && IsPointInAir(target.Position))
             {
                 RespawnHoldDriver.Begin(target.Position, RespawnHoldMinTime, AirRespawnHoldTimeout, null);
             }
