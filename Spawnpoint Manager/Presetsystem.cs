@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,6 +13,7 @@ namespace RespawnPointManager
     {
         public string Scene;
         public float X, Y, Z;
+        public bool Manual;
     }
 
     [Serializable]
@@ -44,7 +45,8 @@ namespace RespawnPointManager
                     Scene = p.SceneName,
                     X = p.Position.x,
                     Y = p.Position.y,
-                    Z = p.Position.z
+                    Z = p.Position.z,
+                    Manual = p.Manual
                 });
             }
 
@@ -68,7 +70,7 @@ namespace RespawnPointManager
             var result = new List<SpawnPoint>();
             foreach (var p in preset.Points)
             {
-                result.Add(new SpawnPoint(new Vector3(p.X, p.Y, p.Z), p.Scene));
+                result.Add(new SpawnPoint(new Vector3(p.X, p.Y, p.Z), p.Scene, p.Manual));
             }
 
             return result;
